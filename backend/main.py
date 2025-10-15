@@ -1,27 +1,32 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
-import anthropic
+import google.generativeai as genai
+from pydantic import BaseModel, field_validator
+from typing import List, Optional, Union
+
 import os
+from dotenv import load_dotenv
 from datetime import datetime
 import json
 import sqlite3
 from pathlib import Path
 import hashlib
+import traceback
+
+load_dotenv()
 
 app = FastAPI(title="Code Review Assistant API")
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000", "*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Database setup
 DB_PATH = "code_reviews.db"
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -50,7 +55,6 @@ def init_db():
 
 init_db()
 
-# Models
 class ReviewResponse(BaseModel):
     id: int
     filename: str
@@ -63,92 +67,41 @@ class ReviewResponse(BaseModel):
     suggestions: List[dict]
     issues: List[dict]
     created_at: str
-
+    
+    @field_validator('suggestions', 'issues', mode='before')
+    @classmethod
+    def parse_json_and_normalize(cls, v):
+        # Parse JSON string if needed
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except json.JSONDecodeError:
+                return []
+        
+        # Ensure it's a list
+        if not isinstance(v, list):
+            return []
+        
+        # Convert string items to dict format
+        result = []
+        for item in v:
+            if isinstance(item, dict):
+                result.append(item)
+            elif isinstance(item, str):
+                # Convert string to dict
+                result.append({"description": item})
+        
+        return result
 class ReviewRequest(BaseModel):
     code: str
     filename: str
     language: Optional[str] = None
 
-# LLM Integration
 def get_llm_client():
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not set")
     return anthropic.Anthropic(api_key=api_key)
-
-def analyze_code_with_llm(code: str, filename: str, language: Optional[str] = None) -> dict:
-    """Analyze code using Claude LLM"""
-    client = get_llm_client()
-    
-    prompt = f"""You are an expert code reviewer. Analyze the following code and provide a comprehensive review.
-
-Filename: {filename}
-Language: {language or 'auto-detect'}
-
-Code:
-```
-{code}
-```
-
-Please provide your analysis in the following JSON format:
-{{
-    "language": "detected language",
-    "review_summary": "2-3 sentence overview of code quality",
-    "readability_score": 1-10,
-    "modularity_score": 1-10,
-    "bug_risk_score": 1-10,
-    "suggestions": [
-        {{
-            "category": "readability|performance|security|best-practices",
-            "severity": "low|medium|high",
-            "line": line_number or null,
-            "title": "Brief title",
-            "description": "Detailed suggestion",
-            "code_snippet": "relevant code" or null,
-            "improved_code": "suggested improvement" or null
-        }}
-    ],
-    "issues": [
-        {{
-            "type": "bug|security|performance|style",
-            "severity": "low|medium|high|critical",
-            "line": line_number or null,
-            "description": "Issue description",
-            "code_snippet": "problematic code"
-        }}
-    ],
-    "positive_aspects": ["list of good practices found"]
-}}
-
-Focus on:
-1. Code readability and maintainability
-2. Modularity and separation of concerns
-3. Potential bugs and edge cases
-4. Security vulnerabilities
-5. Performance issues
-6. Best practices for the language
-7. Documentation quality
-
-Be specific and actionable in your suggestions."""
-
-    try:
-        message = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=4096,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        
-        response_text = message.content[0].text
-        
-        # Extract JSON from response
-        start = response_text.find('{')
-        end = response_text.rfind('}') + 1
-        json_str = response_text[start:end]
-        
-        return json.loads(json_str)
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM analysis failed: {str(e)}")
 
 def calculate_file_hash(content: str) -> str:
     """Calculate SHA256 hash of file content"""
@@ -158,9 +111,9 @@ def save_review_to_db(filename: str, file_hash: str, code: str, analysis: dict) 
     """Save review results to database"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    
+
     lines_of_code = len([l for l in code.split('\n') if l.strip()])
-    
+
     c.execute('''
         INSERT INTO reviews (
             filename, file_hash, language, lines_of_code,
@@ -179,14 +132,114 @@ def save_review_to_db(filename: str, file_hash: str, code: str, analysis: dict) 
         json.dumps(analysis.get('suggestions', [])),
         json.dumps(analysis.get('issues', []))
     ))
-    
+
     review_id = c.lastrowid
     conn.commit()
     conn.close()
-    
     return review_id
 
-# API Endpoints
+
+
+import google.generativeai as genai
+
+def analyze_code_with_llm(code: str, filename: str, language: Optional[str] = None) -> dict:
+    """Analyze code using Google Gemini 2.5 Flash"""
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="GOOGLE_API_KEY not set")
+
+    genai.configure(api_key=api_key)
+
+    try:
+        model = genai.GenerativeModel("models/gemini-2.5-flash")
+        
+        prompt = f"""You are an expert code reviewer. Analyze the following code and
+        return ONLY a valid JSON object (no markdown, no code blocks) in EXACTLY this format:
+
+        {{
+          "language": "detected language",
+          "review_summary": "2-3 sentence overview of code quality",
+          "readability_score": 7,
+          "modularity_score": 8,
+          "bug_risk_score": 3,
+          "suggestions": [
+            {{"type": "improvement", "description": "suggestion text", "line": 10}},
+            {{"type": "best-practice", "description": "another suggestion", "line": 25}}
+          ],
+          "issues": [
+            {{"severity": "medium", "description": "issue description", "line": 15}},
+            {{"severity": "low", "description": "minor issue", "line": 30}}
+          ]
+        }}
+
+        IMPORTANT: 
+        - Return ONLY the JSON object, no markdown formatting
+        - suggestions and issues must be arrays of objects (dictionaries)
+        - Each suggestion must have: type, description, and optionally line
+        - Each issue must have: severity, description, and optionally line
+        - Scores must be numbers from 1-10
+
+        Filename: {filename}
+        Language: {language or 'auto-detect'}
+        
+        Code:
+```
+        {code}
+```
+        """
+
+        response = model.generate_content(prompt)
+        text = response.text.strip()
+        
+        # Remove markdown code blocks if present
+        if text.startswith('```'):
+            lines = text.split('\n')
+            text = '\n'.join(lines[1:-1]) if len(lines) > 2 else text
+            text = text.replace('```json', '').replace('```', '').strip()
+
+        # Try to extract JSON safely
+        start, end = text.find('{'), text.rfind('}') + 1
+        json_str = text[start:end] if start != -1 else "{}"
+
+        try:
+            result = json.loads(json_str)
+            
+            # Ensure suggestions and issues are lists of dicts
+            if 'suggestions' in result and isinstance(result['suggestions'], list):
+                result['suggestions'] = [
+                    s if isinstance(s, dict) else {"type": "general", "description": str(s)}
+                    for s in result['suggestions']
+                ]
+            else:
+                result['suggestions'] = []
+                
+            if 'issues' in result and isinstance(result['issues'], list):
+                result['issues'] = [
+                    i if isinstance(i, dict) else {"severity": "medium", "description": str(i)}
+                    for i in result['issues']
+                ]
+            else:
+                result['issues'] = []
+            
+            return result
+            
+        except json.JSONDecodeError as e:
+            print(f"⚠️ JSON parse error: {e}")
+            print(f"⚠️ Received text: {text[:200]}...")
+            return {
+                "language": language or "Unknown",
+                "review_summary": "Could not parse Gemini output.",
+                "readability_score": 5,
+                "modularity_score": 5,
+                "bug_risk_score": 5,
+                "suggestions": [],
+                "issues": []
+            }
+
+    except Exception as e:
+        print("⚠️ Gemini error:", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Gemini analysis failed: {str(e)}")
 @app.get("/")
 def read_root():
     return {
@@ -203,167 +256,92 @@ def read_root():
 @app.post("/review/upload", response_model=ReviewResponse)
 async def upload_and_review(file: UploadFile = File(...)):
     """Upload a code file and get AI-powered review"""
-    
-    # Read file content
-    content = await file.read()
-    code = content.decode('utf-8')
-    
-    # Detect language from extension
-    ext = Path(file.filename).suffix.lower()
-    language_map = {
-        '.py': 'Python',
-        '.js': 'JavaScript',
-        '.ts': 'TypeScript',
-        '.java': 'Java',
-        '.cpp': 'C++',
-        '.c': 'C',
-        '.go': 'Go',
-        '.rs': 'Rust',
-        '.rb': 'Ruby',
-        '.php': 'PHP',
-        '.swift': 'Swift',
-        '.kt': 'Kotlin'
-    }
-    language = language_map.get(ext, 'Unknown')
-    
-    # Calculate file hash
-    file_hash = calculate_file_hash(code)
-    
-    # Analyze with LLM
-    analysis = analyze_code_with_llm(code, file.filename, language)
-    
-    # Save to database
-    review_id = save_review_to_db(file.filename, file_hash, code, analysis)
-    
-    # Save file
-    file_path = UPLOAD_DIR / f"{review_id}_{file.filename}"
-    with open(file_path, 'w') as f:
-        f.write(code)
-    
-    # Get saved review
-    return get_review(review_id)
+    try:
+        content = await file.read()
+        code = content.decode('utf-8', errors='ignore')
+
+        ext = Path(file.filename).suffix.lower()
+        language_map = {
+            '.py': 'Python', '.js': 'JavaScript', '.ts': 'TypeScript',
+            '.java': 'Java', '.cpp': 'C++', '.c': 'C', '.go': 'Go',
+            '.rs': 'Rust', '.rb': 'Ruby', '.php': 'PHP', '.swift': 'Swift', '.kt': 'Kotlin'
+        }
+        language = language_map.get(ext, 'Unknown')
+
+        file_hash = calculate_file_hash(code)
+        analysis = analyze_code_with_llm(code, file.filename, language)
+        review_id = save_review_to_db(file.filename, file_hash, code, analysis)
+
+        file_path = UPLOAD_DIR / f"{review_id}_{file.filename}"
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(code)
+
+        return get_review(review_id)
+
+    except Exception as e:
+        print("\n--- ERROR DURING UPLOAD ---")
+        traceback.print_exc()
+        print("----------------------------\n")
+        raise HTTPException(status_code=500, detail=f"Internal Error: {str(e)}")
 
 @app.post("/review/analyze", response_model=ReviewResponse)
 async def analyze_code(request: ReviewRequest):
     """Analyze code from request body"""
-    
     file_hash = calculate_file_hash(request.code)
-    
-    # Analyze with LLM
     analysis = analyze_code_with_llm(request.code, request.filename, request.language)
-    
-    # Save to database
     review_id = save_review_to_db(request.filename, file_hash, request.code, analysis)
-    
     return get_review(review_id)
 
 @app.get("/reviews", response_model=List[ReviewResponse])
 def list_reviews(limit: int = 50, offset: int = 0):
-    """List all code reviews"""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    
-    c.execute('''
-        SELECT * FROM reviews 
-        ORDER BY created_at DESC 
-        LIMIT ? OFFSET ?
-    ''', (limit, offset))
-    
+    c.execute('SELECT * FROM reviews ORDER BY created_at DESC LIMIT ? OFFSET ?', (limit, offset))
     rows = c.fetchall()
     conn.close()
     
-    reviews = []
+    results = []
     for row in rows:
-        reviews.append(ReviewResponse(
-            id=row['id'],
-            filename=row['filename'],
-            language=row['language'],
-            lines_of_code=row['lines_of_code'],
-            review_summary=row['review_summary'],
-            readability_score=row['readability_score'],
-            modularity_score=row['modularity_score'],
-            bug_risk_score=row['bug_risk_score'],
-            suggestions=json.loads(row['suggestions']),
-            issues=json.loads(row['issues']),
-            created_at=row['created_at']
-        ))
+        data = dict(row)
+        data['suggestions'] = json.loads(data['suggestions']) if isinstance(data['suggestions'], str) else data['suggestions']
+        data['issues'] = json.loads(data['issues']) if isinstance(data['issues'], str) else data['issues']
+        results.append(ReviewResponse(**data))
     
-    return reviews
+    return results
 
 @app.get("/reviews/{review_id}", response_model=ReviewResponse)
 def get_review(review_id: int):
-    """Get a specific review by ID"""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    
     c.execute('SELECT * FROM reviews WHERE id = ?', (review_id,))
     row = c.fetchone()
     conn.close()
-    
     if not row:
         raise HTTPException(status_code=404, detail="Review not found")
     
-    return ReviewResponse(
-        id=row['id'],
-        filename=row['filename'],
-        language=row['language'],
-        lines_of_code=row['lines_of_code'],
-        review_summary=row['review_summary'],
-        readability_score=row['readability_score'],
-        modularity_score=row['modularity_score'],
-        bug_risk_score=row['bug_risk_score'],
-        suggestions=json.loads(row['suggestions']),
-        issues=json.loads(row['issues']),
-        created_at=row['created_at']
-    )
-
-@app.delete("/reviews/{review_id}")
-def delete_review(review_id: int):
-    """Delete a review"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('DELETE FROM reviews WHERE id = ?', (review_id,))
-    deleted = c.rowcount
-    conn.commit()
-    conn.close()
+    # Convert row to dict and parse JSON strings
+    data = dict(row)
+    data['suggestions'] = json.loads(data['suggestions']) if isinstance(data['suggestions'], str) else data['suggestions']
+    data['issues'] = json.loads(data['issues']) if isinstance(data['issues'], str) else data['issues']
     
-    if deleted == 0:
-        raise HTTPException(status_code=404, detail="Review not found")
-    
-    return {"message": "Review deleted successfully"}
+    return ReviewResponse(**data)
 
 @app.get("/stats")
 def get_stats():
-    """Get overall statistics"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    
-    c.execute('SELECT COUNT(*) as total FROM reviews')
+    c.execute('SELECT COUNT(*) FROM reviews')
     total = c.fetchone()[0]
-    
-    c.execute('SELECT AVG(readability_score) as avg_read FROM reviews')
-    avg_readability = c.fetchone()[0] or 0
-    
-    c.execute('SELECT AVG(modularity_score) as avg_mod FROM reviews')
-    avg_modularity = c.fetchone()[0] or 0
-    
-    c.execute('SELECT AVG(bug_risk_score) as avg_bug FROM reviews')
-    avg_bug_risk = c.fetchone()[0] or 0
-    
-    c.execute('SELECT language, COUNT(*) as count FROM reviews GROUP BY language')
+    c.execute('SELECT AVG(readability_score), AVG(modularity_score), AVG(bug_risk_score) FROM reviews')
+    avg_read, avg_mod, avg_bug = [round(x or 0, 1) for x in c.fetchone()]
+    c.execute('SELECT language, COUNT(*) FROM reviews GROUP BY language')
     languages = dict(c.fetchall())
-    
     conn.close()
-    
     return {
         "total_reviews": total,
-        "average_scores": {
-            "readability": round(avg_readability, 1),
-            "modularity": round(avg_modularity, 1),
-            "bug_risk": round(avg_bug_risk, 1)
-        },
+        "average_scores": {"readability": avg_read, "modularity": avg_mod, "bug_risk": avg_bug},
         "languages": languages
     }
 
