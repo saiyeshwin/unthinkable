@@ -83,7 +83,7 @@ It uses a FastAPI backend connected to the Google Gemini 1.5 Flash model and a R
 
 | Variable         | Description                                                                               |
 | ---------------- | ----------------------------------------------------------------------------------------- |
-| `GOOGLE_API_KEY` | Your Gemini 1.5 API key from [Google AI Studio](https://makersuite.google.com/app/apikey) |
+| `GOOGLE_API_KEY` | Your Gemini 2.5 Flash API key from [Google AI Studio](https://makersuite.google.com/app/apikey) |
 
 ---
 
